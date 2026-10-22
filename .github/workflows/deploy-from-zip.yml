@@ -1,0 +1,121 @@
+name: Deploy THIRTEEN from uploaded ZIP
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "incoming/THIRTEEN.zip"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: thirteen-zip-deploy
+  cancel-in-progress: false
+
+jobs:
+  extract-build-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Stop gracefully if ZIP was deleted
+        id: zipcheck
+        shell: bash
+        run: |
+          if [ -f "incoming/THIRTEEN.zip" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "The upload ZIP is not present (for example, it was deleted before replacement). Nothing to deploy."
+          fi
+
+      - name: Set up Bun
+        if: steps.zipcheck.outputs.present == 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Safely extract uploaded ZIP
+        if: steps.zipcheck.outputs.present == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, zipfile
+          from pathlib import Path
+
+          archive = Path("incoming/THIRTEEN.zip")
+          target = Path(os.environ["RUNNER_TEMP"]) / "thirteen-zip-source"
+          target.mkdir(parents=True, exist_ok=True)
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  name = item.filename.replace("\\", "/")
+                  path = Path(name)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"Unsafe ZIP path rejected: {item.filename}")
+                  # Never allow a ZIP to install/replace GitHub workflows.
+                  if path.parts and path.parts[0] == ".github":
+                      print(f"Skipping protected path: {item.filename}")
+                      continue
+                  dest = (target / path).resolve()
+                  if target.resolve() not in dest.parents and dest != target.resolve():
+                      raise SystemExit(f"Unsafe ZIP destination rejected: {item.filename}")
+                  if item.is_dir():
+                      dest.mkdir(parents=True, exist_ok=True)
+                  else:
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      with z.open(item) as src, open(dest, "wb") as dst:
+                          dst.write(src.read())
+
+          # Support either files at ZIP root or one enclosing project folder.
+          source = target
+          if not (source / "package.json").is_file():
+              candidates = [p for p in source.iterdir() if p.is_dir() and (p / "package.json").is_file()]
+              if len(candidates) == 1:
+                  source = candidates[0]
+              else:
+                  raise SystemExit("Could not find package.json at ZIP root or in one unambiguous project folder.")
+
+          (Path(os.environ["RUNNER_TEMP"]) / "thirteen-source-path.txt").write_text(str(source))
+          print(f"Project source found at: {source}")
+          PY
+
+      - name: Replace project files from ZIP
+        if: steps.zipcheck.outputs.present == 'true'
+        shell: bash
+        run: |
+          SOURCE_DIR="$(cat "$RUNNER_TEMP/thirteen-source-path.txt")"
+          # Keep Git metadata, this workflow, the upload ZIP, and generated build folders.
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='incoming/' \
+            --exclude='node_modules/' \
+            --exclude='dist/' \
+            "$SOURCE_DIR/" "$GITHUB_WORKSPACE/"
+
+      - name: Install dependencies
+        if: steps.zipcheck.outputs.present == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Build website
+        if: steps.zipcheck.outputs.present == 'true'
+        run: bun run build
+
+      - name: Commit updated source for Netlify
+        if: steps.zipcheck.outputs.present == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git commit -m "Deploy THIRTEEN source from uploaded ZIP"
+          git push origin HEAD:main
